@@ -12,7 +12,9 @@ import { z } from 'zod';
 import { Hono } from 'hono';
 import { Ai } from '@cloudflare/ai';
 import { stream, streamText, streamSSE } from 'hono/streaming';
-import { zValidator } from '@hono/zod-validator'
+import { zValidator } from '@hono/zod-validator';
+import pages from './pages';
+import { UpdateCount, renderString, systemExtractCount } from './prompts';
 
 type Env = {
 	// Example binding to KV. Learn more at https://developers.cloudflare.com/workers/runtime-apis/kv/
@@ -35,11 +37,11 @@ type Env = {
 const app = new Hono<{ Bindings: Env }>();
 
 app.onError((err, c) => {
-  return c.json(err)
-})
+	return c.json(err);
+});
 
 app
-	.get('/', (c) => c.text('Hello Cloudflare Workers!'))
+	.route('/', pages)
 	.get('/ai', async (c) => {
 		const ai = new Ai(c.env.AI);
 		const output = await ai.run('@hf/thebloke/openhermes-2.5-mistral-7b-awq', {
@@ -48,43 +50,81 @@ app
 		return c.json(output);
 	})
 	.get('/total', async (c) => {
-		const total = MaybeTotal.parse(await c.env.DEMO_KV.get('count', { type: 'json'}));
+		const total = MaybeTotal.parse(await c.env.DEMO_KV.get('count', { type: 'json' }));
 		return c.json(total);
 	})
-	.post('/total/ai', zValidator(
-    'json',
-    z.object({
-      username: z.string(),
-    })
-  ),async (c) => {
-		return streamSSE(c, async (stream) => {
-		const total = MaybeTotal.parse(await c.env.DEMO_KV.get('count', { type: 'json' }));
-		const ai = new Ai(c.env.AI);
-		const {username} = c.req.valid("json")
+	.post(
+		'/total/ai',
+		zValidator(
+			'json',
+			z.object({
+				username: z.string(),
+			})
+		),
+		async (c) => {
+			return streamSSE(c, async (stream) => {
+				const total = MaybeTotal.parse(await c.env.DEMO_KV.get('count', { type: 'json' }));
+				const ai = new Ai(c.env.AI);
+				const { username } = c.req.valid('json');
 
-		const output = await ai.run('@hf/thebloke/openhermes-2.5-mistral-7b-awq', {
-			stream: true,
-			messages: [
-				{
-					role: 'user',
-					content: `# Instruction #\nTell me what the current total is and when it was last updated. Ensure the last update timestamp is provided in a human readable way and the user is greeted by their provided name.\n\n# Input #\nUsername: ${username}\nData: ${JSON.stringify(
-						total
-					)}`,
-				},
-			],
-		});
-		// return c.json(output);
-			await stream.pipe(output);
-		});
-	})
+				const output = await ai.run('@hf/thebloke/openhermes-2.5-mistral-7b-awq', {
+					stream: true,
+					messages: [
+						{
+							role: 'user',
+							content: `# Instruction #\nTell me what the current total is and when it was last updated. Ensure the last update timestamp is provided in a human readable way and the user is greeted by their provided name.\n\n# Input #\nUsername: ${username}\nData: ${JSON.stringify(
+								total
+							)}`,
+						},
+					],
+				});
+				await stream.pipe(output);
+			});
+		}
+	)
+	.post(
+		'/update-count',
+		zValidator(
+			'form',
+			z.object({
+				message: z.string().min(1).max(512),
+			})
+		),
+		async (c) => {
+			const { message } = c.req.valid('form');
+			const ai = new Ai(c.env.AI);
+			const output = await ai.run('@hf/thebloke/openhermes-2.5-mistral-7b-awq', {
+				messages: [
+					{
+						role: 'system',
+						content: await renderString(systemExtractCount, {
+							outputSchema: UpdateCount.jsonSchema,
+						}),
+					},
+					{
+						role: 'user',
+						content: message,
+					},
+				],
+			});
+			const { delta } = UpdateCount.parse(output.response);
+
+			await sendDeltaMessage(c.env.DEMO_QUEUE, delta);
+			return c.html(`<pre>${JSON.stringify(output, null, 2)}</pre>`);
+		}
+	)
 	.get('/inc', async (c) => {
-		await c.env.DEMO_QUEUE.send({ delta: 1, timestamp: new Date().toISOString() });
+		await sendDeltaMessage(c.env.DEMO_QUEUE, 1);
 		return c.json({ message: 'OK' });
 	})
 	.get('/dec', async (c) => {
-		await c.env.DEMO_QUEUE.send({ delta: -1, timestamp: new Date().toISOString() });
+		await sendDeltaMessage(c.env.DEMO_QUEUE, -1);
 		return c.json({ message: 'OK' });
 	});
+
+async function sendDeltaMessage(queue: Queue<DeltaMsg>, delta: number) {
+	await queue.send({ delta, timestamp: new Date().toISOString() });
+}
 
 function getNewTotal(lastTotal: Total | null, delta: number = 1) {
 	let total;
