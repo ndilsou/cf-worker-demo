@@ -13,7 +13,7 @@ import { Hono } from 'hono';
 import { Ai } from '@cloudflare/ai';
 import { stream, streamText, streamSSE } from 'hono/streaming';
 import { zValidator } from '@hono/zod-validator';
-import pages from './pages';
+import pages, { ResultPage } from './pages';
 import { UpdateCount, renderString, systemExtractCount } from './prompts';
 
 type Env = {
@@ -22,7 +22,7 @@ type Env = {
 	AI: Ai;
 	//
 	// Example binding to Durable Object. Learn more at https://developers.cloudflare.com/workers/runtime-apis/durable-objects/
-	// MY_DURABLE_OBJECT: DurableObjectNamespace;
+	DO_COUNTER: DurableObjectNamespace;
 	//
 	// Example binding to R2. Learn more at https://developers.cloudflare.com/workers/runtime-apis/r2/
 	// MY_BUCKET: R2Bucket;
@@ -50,8 +50,16 @@ app
 		return c.json(output);
 	})
 	.get('/total', async (c) => {
-		const total = MaybeTotal.parse(await c.env.DEMO_KV.get('count', { type: 'json' }));
-		return c.json(total);
+		const id = c.env.DO_COUNTER.idFromName('counter');
+		const counter = c.env.DO_COUNTER.get(id);
+		try {
+			const value = await counter.fetch('https://example.com/').then((res) => res.json());
+			const total = Total.parse(value);
+			return c.json(total);
+		} catch (e) {
+			console.error(e);
+			return c.json({ error: e.message });
+		}
 	})
 	.post(
 		'/total/ai',
@@ -63,7 +71,11 @@ app
 		),
 		async (c) => {
 			return streamSSE(c, async (stream) => {
-				const total = MaybeTotal.parse(await c.env.DEMO_KV.get('count', { type: 'json' }));
+				// const total = MaybeTotal.parse(await c.env.DEMO_KV.get('count', { type: 'json' }));
+				const id = c.env.DO_COUNTER.idFromName('counter');
+				const counter = c.env.DO_COUNTER.get(id);
+				const total = Total.parse(await counter.fetch(new Request('/')).then((res) => res.json()));
+
 				const ai = new Ai(c.env.AI);
 				const { username } = c.req.valid('json');
 
@@ -110,7 +122,7 @@ app
 			const { delta } = UpdateCount.parse(output.response);
 
 			await sendDeltaMessage(c.env.DEMO_QUEUE, delta);
-			return c.html(`<pre>${JSON.stringify(output, null, 2)}</pre>`);
+			return c.html(<ResultPage delta={delta}/>);
 		}
 	)
 	.get('/inc', async (c) => {
@@ -126,24 +138,7 @@ async function sendDeltaMessage(queue: Queue<DeltaMsg>, delta: number) {
 	await queue.send({ delta, timestamp: new Date().toISOString() });
 }
 
-function getNewTotal(lastTotal: Total | null, delta: number = 1) {
-	let total;
-	if (lastTotal) {
-		total = {
-			count: lastTotal.count + delta,
-			createdAt: lastTotal.createdAt,
-			updatedAt: new Date(),
-		};
-	} else {
-		const createdAt = new Date();
-		total = {
-			count: delta,
-			createdAt,
-			updatedAt: createdAt,
-		};
-	}
-	return total;
-}
+
 
 type DeltaMsg = {
 	delta: number;
@@ -156,27 +151,87 @@ const Total = z.object({
 	updatedAt: z.coerce.date(),
 });
 
-const MaybeTotal = Total.nullable();
+const MaybeTotal = Total.optional().default(() => {
+	const createdAt = new Date();
+	return {
+		count: 0,
+		createdAt,
+		updatedAt: createdAt,
+	};
+});
 
 type Total = z.infer<typeof Total>;
 
-// const DeltaMsg = z.object({
-// 	delta: z.number().int(),
-// 	timestamp: z.coerce.date(),
-// });
+export class DurableCounter {
+	state: DurableObjectState;
+	constructor(state: DurableObjectState, env: Env) {
+		this.state = state;
+	}
+
+	async fetch(request: Request) {
+		const url = new URL(request.url);
+		if (url.pathname !== '/') {
+			return new Response('Not found', { status: 404 });
+		}
+
+		let value = await this.state.storage.get('count')
+		if (typeof value === 'string') {
+			value = JSON.parse(value);
+		}
+		let total = MaybeTotal.parse(value);
+
+		let delta: number;
+		switch (request.method) {
+			case 'GET':
+				// serves the current value.
+				break;
+			case 'POST':
+				delta = parseInt(url.searchParams.get('delta') || '1');
+				total = this.getNewTotal(total, delta);
+				await this.state.storage.put('count', total);
+				break;
+			default:
+				return new Response(undefined, { status: 404, statusText: 'Not found' });
+		}
+
+		return new Response(JSON.stringify(total), {
+			headers: {
+				'content-type': 'application/json',
+			},
+		});
+	}
+
+	private getNewTotal(lastTotal: Total | null | undefined, delta: number = 1) {
+		let total;
+		if (lastTotal) {
+			total = {
+				count: lastTotal.count + delta,
+				createdAt: lastTotal.createdAt,
+				updatedAt: new Date(),
+			};
+		} else {
+			const createdAt = new Date();
+			total = {
+				count: delta,
+				createdAt,
+				updatedAt: createdAt,
+			};
+		}
+		return total;
+	}
+}
 
 export default {
 	fetch: app.fetch,
 	async queue(batch: MessageBatch<DeltaMsg>, env: Env): Promise<void> {
-		console.log('received batch');
+		let cumdelta = 0;
 		for (const message of batch.messages) {
-			// const payload = DeltaMsg.parse(message.body);
 			const payload = message.body;
-			const previousTotal = MaybeTotal.parse(await env.DEMO_KV.get('count', { type: 'json' }));
-			console.log('previousTotal', previousTotal);
-			let total = getNewTotal(previousTotal, payload.delta);
-
-			await env.DEMO_KV.put('count', JSON.stringify(total));
+			cumdelta += payload.delta;
 		}
+
+		const id = env.DO_COUNTER.idFromName('counter');
+		const counter = env.DO_COUNTER.get(id);
+		await counter.fetch(new Request(`https://example.com/?delta=${cumdelta}`, { method: 'POST' }));
 	},
 };

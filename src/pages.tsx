@@ -14,6 +14,18 @@ const Layout: FC = (props) => {
 	);
 };
 
+export const ResultPage: FC<{ delta: number }> = ({ delta }) => {
+	const s = `I have updated the counter by ${delta}`;
+	return (
+		<Layout>
+			<main class="w-full h-full flex flex-col items-center justify-center">
+				<h1 class="text-4xl font-bold text-stone-50">AI Counter</h1>
+				<div class="mt-4 rounded border border-stone-50 max-w-2xl flex flex-col w-full p-4 gap-2">{s}</div>
+			</main>
+		</Layout>
+	);
+};
+
 const app = new Hono();
 
 app.get('/', async (c) => {
